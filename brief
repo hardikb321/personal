@@ -1,0 +1,159 @@
+
+# Project Summary & Model Flow — genai_moe_loader
+
+## 1. Project Objective
+
+The goal is to **optimize runtime memory efficiency of Mixture-of-Experts (MoE) models** by dynamically loading only the necessary experts from each MoE layer (as determined by the gate output), instead of loading all experts into memory. The core innovation is replacing **brute-force similarity search** with **approximate nearest neighbor (ANN) search** (IVF and HNSW) to find the most similar expert activation pattern from a pre-computed trace, enabling expert prediction and prefetching.
+
+**Model used:** LLaMA-MoE-v1-3.5B (32 layers, 16 experts/layer, 688 dim each, bfloat16)
+
+---
+
+## 2. Whole Pipeline / Model Flow
+
+### Phase 1: Trace Collection (Offline)
+- During model inference, each MoE layer's **gate output** (raw logits for all 16 experts) is captured per layer per token.
+- These gate outputs are accumulated into an **Expert Activation Matrix (EAM)** of shape `(num_layers, num_experts)` = `(32, 16)` per input sequence.
+- Millions of these EAMs are collected and stored as `.npy` trace files — this forms the **trace dataset** (~8.1M entries).
+
+### Phase 2: Semantic Deduplication (SemDeDup) (Offline)
+- The trace dataset is huge (~8.1M entries). Many EAMs are semantically similar/duplicate.
+- **SemDeDup pipeline** (adapted from Meta's SemDeDup):
+  1. Load `.npy` files, flatten each `(32×16)` matrix to a 512-dim vector
+  2. Run **K-Means clustering** (faiss, 1000 clusters)
+  3. Sort clusters by distance to centroid
+  4. Compute pairwise **cosine similarity** within clusters, mark duplicates (epsilon threshold, e.g., ε=0.1)
+  5. Extract deduplicated data — keep representative entries, merge groups by averaging
+  6. Save deduplicated dataset → `dedup_data_eps0.1/`
+- This reduces the trace dataset significantly (e.g., from 8.1M → much smaller), saving memory and speeding up search.
+
+### Phase 3: IVF Index Building (Offline)
+- The deduplicated trace data is preprocessed:
+  1. **Slice** to layers `[0..layer_idx]` (e.g., layers 0–11, dim = 12×16 = 192)
+  2. **Softmax normalize** per layer
+  3. **L2 normalize** each layer independently
+  4. **Flatten** to 1D vector
+  5. **L2 normalize** the entire flattened vector (so inner product = cosine similarity)
+- A **FAISS IVF (Inverted File Index)** is built:
+  - `nlist=100` Voronoi cells (coarse quantizer)
+  - `nprobe=10` cells searched at query time
+  - Metric: inner product (cosine similarity on L2-normalized vectors)
+- After index building, raw trace data is saved to disk as a **memmap file** to free RAM.
+- **HNSW** (Hierarchical Navigable Small World) index is also implemented as an alternative (M=32, efConstruction=200, efSearch=64) — both Python and C++ versions exist.
+
+### Phase 4: Online Inference (Expert Prediction + Prefetching)
+This is the main runtime flow, integrated into the model's `generate()` method:
+
+1. **Initialization:** `ExpertPredictionMixin` patches `GenerationMixin.generate()` to initialize:
+   - **ExpertTracer** — loads trace folder, builds IVF indexes, performs similarity search
+   - **ExpertPredictor** — predicts which experts will be needed for future layers
+   - **ExpertPreloader** — dual-queue system (on-demand + prefetch) for loading expert weights from disk
+
+2. **Per-token generation loop:**
+   - For each MoE layer during forward pass, the **gate output** (expert scores) is captured and accumulated into the current sequence's EAM via `tracer.update_entry()`.
+   - **Prediction starts at layer 11** (`PREDICTION_START_LAYER = 11`). For layers 0–10, only the trace entry is updated (cheap), no search is performed.
+   - At layer 11, the **first and only IVF search** is performed:
+     - The current EAM (layers 0–11) is preprocessed (same as Phase 3) and queried against the IVF index.
+     - The most similar trace entry is found → this gives the predicted expert activation pattern for all future layers (12–31).
+   - A **snapshot** is created: top-K=4 experts per future layer are extracted from the matched entry.
+   - For all subsequent layers (12+), the snapshot is reused — **no more IVF searches needed** (one search per token).
+
+3. **Expert Prefetching:**
+   - The predicted experts (from the snapshot) are enqueued for **background prefetching** via `ExpertPreloader`.
+   - Expert weights are loaded from disk using **mmap** (file-backed tensors, page cache) to avoid heap allocation.
+   - Weights are loaded into the model's `experts_obj` immediately, then the weight tensors are freed from cache (no double storage).
+   - **Stale experts** from previous layers are released to cap memory usage.
+   - On-demand loading (high priority) is used for experts needed immediately.
+
+4. **Expert Caching & Eviction:**
+   - **ExpertCache** manages GPU/CPU expert caches with capacity limits.
+   - Eviction policies: LRU, LFU, and **priority score** (combines frequency, topology decay, and sequence-level scores).
+   - Protected experts (on-demand, prefetch, by-layer) cannot be evicted.
+
+### Phase 5: Benchmarking
+The notebook `POC-inference-cuda-bench.ipynb` measures:
+- **Model load time** (offline)
+- **IVF index build time** (offline, excluded from inference metrics)
+- **TTFT** (Time To First Token)
+- **Average token generation time** & tokens/sec throughput
+- **Memory:** RSS before/after, peak RSS during inference, CUDA memory delta
+- **Prediction accuracy:** cos_dist ~0.0015 (excellent match), 90–100% hit rates
+
+---
+
+## 3. Key Components Summary
+
+| Component | File | Role |
+|---|---|---|
+| **ExpertTracer** | `expert_tracer.py` | Loads traces, builds IVF index, finds most similar EAM (brute-force / chunked / IVF modes) |
+| **ExpertPredictor** | `expert_predictor.py` | Predicts future experts from matched trace entry; creates snapshot at layer 11 |
+| **ExpertPreloader** | `expert_preloader.py` | Dual-queue (on-demand + prefetch) expert weight loading from disk via mmap |
+| **ExpertPredictionMixin** | `expert_prediction_mixin.py` | Patches `generate()` to integrate tracer + predictor + preloader |
+| **ExpertCache** | `expert_cache.py` | GPU/CPU expert cache with eviction policies (LRU/LFU/priority) |
+| **ExpertPrefetcher** | `expert_prefetcher.py` | Interface for prefetching expert tensors via archer engine |
+| **SemDeDup** | `run_semdedup.py` | Semantic deduplication of trace data (K-Means + cosine sim) |
+| **IVF Test** | `test_ivf.py` | Accuracy benchmark for IVF search (Python + C++) |
+| **HNSW Test** | `test_hnsw.py` | Accuracy benchmark for HNSW search (Python + C++) |
+
+---
+
+## 4. What Was Implemented vs. Future Work
+
+### ✅ Implemented
+- Brute-force similarity search (baseline)
+- Chunked search (memory-efficient brute-force, one file at a time)
+- **IVF (Inverted File Index)** search — fully integrated into the model
+- SemDeDup for trace data deduplication
+- Expert prediction with snapshot optimization (one IVF search per token)
+- Expert preloading with mmap, dual-queue, stale expert release
+- Memory optimizations: MALLOC_ARENA_MAX=2, memmap trace storage, no double storage of weights
+- C++ and Python implementations of both IVF and HNSW
+
+### 🔮 Future Work
+- **HNSW integration** into the model (currently only benchmarked standalone, not integrated into `expert_tracer.py`)
+- Fix prefetching pipeline (snapshot mechanism not fully triggering `enqueue_prefetch` during inference)
+- Pre-build all needed IVF indexes offline (currently some built lazily)
+- GPU acceleration (currently running on CPU)
+- Quantization of expert weights for further memory savings
+
+---
+
+## 5. Data Flow Diagram (for PPT)
+
+```
+[Input Text]
+     │
+     ▼
+[Tokenize] → [Model Forward Pass: Layer 0..31]
+     │
+     │  For each MoE layer:
+     │  ├── Gate output (16 expert scores) captured
+     │  └── Accumulated into EAM (32×16 matrix)
+     │
+     │  At Layer 11 (PREDICTION_START_LAYER):
+     │  ├── Preprocess EAM[0..11] → 192-dim vector
+     │  ├── IVF Search against deduplicated trace (~M entries)
+     │  ├── Find most similar trace entry (cos_dist ~0.0015)
+     │  └── Create snapshot: top-4 experts per future layer (12..31)
+     │
+     │  Layers 12..31:
+     │  ├── Use snapshot for expert prediction
+     │  └── Prefetch expert weights from disk (mmap, background threads)
+     │
+     ▼
+[Generated Token] → repeat for N tokens
+```
+
+**Offline pipeline:**
+```
+[Raw Traces (8.1M EAMs)] → [SemDeDup (K-Means + Cosine Sim)] → [Dedup Traces]
+                                                                        │
+                                                                        ▼
+                                                              [Preprocess: Softmax → L2-norm → Flatten → L2-norm]
+                                                                        │
+                                                                        ▼
+                                                              [Build FAISS IVF Index (nlist=100, nprobe=10)]
+                                                                        │
+                                                                        ▼
+                                                              [Save trace to memmap on disk → Free RAM]
+```
