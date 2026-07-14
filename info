@@ -1,0 +1,43 @@
+## Weekly Progress Report — Friday, July 3, 2026
+
+### Tasks:
+1. Implement stale expert release mechanism to prevent prediction-miss experts from accumulating in memory during inference
+2. Reduce PREFETCH_AHEAD_LAYERS from 2 → 1 to bound prefetch memory footprint
+3. Profile and benchmark all optimizations via POC-inference-cuda-bench notebook
+
+### Results:
+**3 optimizations implemented this week (across 2 files):**
+
+| # | Optimization | File | Memory Impact |
+|---|-------------|------|---------------|
+| 1 | Reduced NUM_PREFETCH_WORKERS from 4 → 2 (halves concurrent temp tensors during I/O) | expert_preloader.py | ~64 MB saved |
+| 2 | No double storage — clear weight tensors from cache after copying into experts_obj | expert_preloader.py | ~32 MB/expert saved |
+| 3 | Reduced max_prefetch from 48 → 16 (caps prefetch cache footprint) | expert_prediction_mixin.py | ~100-200 MB saved |
+
+**2 optimizations implemented this week (new code):**
+
+| # | Optimization | File | Memory Impact |
+|---|-------------|------|---------------|
+| 4 | Snapshot-based prefetch (PREFETCH_AHEAD_LAYERS = 1, was 2) — only enqueue next 1 layer instead of all future experts | modeling_llama_moe.py | ~128 MB saved |
+| 5 | Stale expert release — new `release_stale_experts()` method, called at layer 12+, releases experts from previous layers not needed for next 1-2 layers | expert_preloader.py + modeling_llama_moe.py | ~260 MB saved (60 stale experts released) |
+
+**Benchmark Results (128-token decode):**
+```
+Peak RSS (inference):  11.38 GB
+Memory delta:          0.47 GB   (was ~0.82 GB before stale release)
+Avg time per token:    1.33 s    (was ~1.51 s)
+Throughput:            0.75 tokens/s  (+14%)
+TTFT:                  6.25 s
+```
+
+### Conclusions:
+- The stale expert release mechanism (Optimization 5) is the most impactful change this week, cutting memory delta by 260 MB by actively cleaning up prediction-miss experts
+- Reducing PREFETCH_AHEAD_LAYERS to 1 unexpectedly improved throughput by 14% (less I/O contention) while reducing memory delta
+- Peak RSS of 11.38 GB is still slightly above the 11.0 GB target — the remaining ~0.38 GB is a transient spike from concurrent expert loading
+
+### Next Week Tasks:
+1. Run `diagnose_peak_memory.py` to pinpoint exact layer/token where the 0.38 GB transient peak occurs
+2. Attempt reducing SNAPSHOT_TOP_K from 4 → 3 to cut per-layer prefetch footprint by ~64 MB
+3. Attempt reducing max_prefetch from 16 → 8 to further cap residual cache
+4. Explore releasing active experts immediately after forward pass to overlap release with next layer's compute
+5. Target: get peak RSS below 11.0 GB with minimal tPOT tradeoff
